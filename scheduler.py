@@ -199,6 +199,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         df_result = pd.DataFrame(results)
     
         if excluded_jobs:
+            import streamlit as st
             st.subheader("🛑 除外ジョブ一覧（理由つき）")
             for msg in excluded_jobs:
                 if "❌" in msg:
