@@ -10,13 +10,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
     TOTAL_SLOTS = SLOTS_PER_DAY * 7
 
-    # 稼働中の槽のみ
+    # 稼働中の槽のみ抽出
     so_dict = {
-        row['SoID']: row for _, row in sos_df.iterrows()
-        if str(row.get('Status')).strip() == '稼働中'
+        str(row['SoID']).strip(): row for _, row in sos_df.iterrows()
+        if str(row.get('Status', '')).strip() == '稼働中'
     }
 
-    # 作業スロット定義
+    # 作業者の勤務可能スロット
     global_workable_slots = [False] * TOTAL_SLOTS
     for _, w in workers_df.iterrows():
         for d in range(7):
@@ -32,7 +32,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     excluded_jobs = []
 
     for i, job in jobs_df.iterrows():
-        job_id = str(job.get('JobID', f"job_{i}"))
+        job_id = str(job.get('JobID', f"job_{i}")).strip()
 
         try:
             soak = int(float(job['入槽時間'])) // SLOT_MIN
@@ -42,13 +42,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             excluded_jobs.append(f"{job_id}: 時間の変換に失敗（{e}）")
             continue
 
-        required_type = str(job.get('RequiredSoType', '')).strip()
         job_type = str(job.get('PlatingType', '')).strip()
+        required_type = str(job.get('RequiredSoType', '')).strip()
 
         valid_sos = [
             soid for soid, row in so_dict.items()
-            if job_type in str(row['PlatingType']) and
-               (required_type == '' or row.get('SoType', '') == required_type)
+            if job_type == str(row.get('PlatingType', '')).strip()
+            and (required_type == '' or required_type == str(row.get('SoType', row.get('種類', ''))).strip())
         ]
 
         if not valid_sos:
@@ -67,7 +67,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_start = plate_end
         rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        # 勤務時間外配置制限
         restricted = True
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
             soak_range = list(range(t, t + soak))
