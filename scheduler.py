@@ -9,10 +9,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
     TOTAL_SLOTS = SLOTS_PER_DAY * 7
 
-    # 稼働中の槽だけ辞書に登録
+    # 稼働中の槽のみ使用
     so_dict = {row['SoID']: row for _, row in sos_df.iterrows() if row['Status'] == '稼働中'}
 
-    # 作業者スロットマップ
+    # 作業者スロット定義
     worker_slots = {}
     global_workable_slots = [False] * TOTAL_SLOTS
     for _, w in workers_df.iterrows():
@@ -37,11 +37,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
             rinse = int(float(job['出槽時間']) * 60) // SLOT_MIN
         except:
-            continue  # 数値変換できないものはスキップ
+            continue  # 数値変換失敗時スキップ
 
         valid_sos = [soid for soid, row in so_dict.items() if row['PlatingType'] == job['PlatingType']]
         if not valid_sos:
-            continue  # 対応タンクなし
+            continue
 
         pres = model.NewBoolVar(f"assigned_{i}")
         start = model.NewIntVar(0, TOTAL_SLOTS - soak - duration - rinse, f"start_{i}")
@@ -55,7 +55,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_start = plate_end
         rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        # 勤務時間外でのSoak/Rinseを防ぐ
+        # 🛡 勤務時間外に Soak/Rinse を配置できない制約
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
@@ -67,13 +67,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         assigned.append(pres)
         job_results.append((i, start, soak, duration, rinse, pres, job['JobID'], job['PlatingType'], valid_sos[0]))
 
-    # NoOverlap by Tank
+    # 🛢 各槽の重複禁止
     for soid in so_dict.keys():
         intervals = [iv for iv, soids in all_intervals if soid in soids]
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # 目的：最大スケジュール数
+    # 🎯 最大ジョブ数を目的
     model.Maximize(sum(assigned))
 
     solver = cp_model.CpSolver()
