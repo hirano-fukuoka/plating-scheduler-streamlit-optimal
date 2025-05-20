@@ -55,7 +55,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_start = plate_end
         rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        # 🛡 勤務時間外に Soak/Rinse を配置できない制約
+        # 勤務時間外に Soak/Rinse を配置できない制約
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
@@ -67,13 +67,12 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         assigned.append(pres)
         job_results.append((i, start, soak, duration, rinse, pres, job['JobID'], job['PlatingType'], valid_sos[0]))
 
-    # 🛢 各槽の重複禁止
+    # 各槽の NoOverlap 制約
     for soid in so_dict.keys():
         intervals = [iv for iv, soids in all_intervals if soid in soids]
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # 🎯 最大ジョブ数を目的
     model.Maximize(sum(assigned))
 
     solver = cp_model.CpSolver()
