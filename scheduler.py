@@ -34,7 +34,8 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     job_results = []
 
     for i, job in jobs_df.iterrows():
-        duration = int(job['PlatingMin']) // SLOT_MIN
+        # 修正後（PlatingMin は時間なので ×60 で分に直す）
+        duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
         soak = int(job['入槽時間']) // SLOT_MIN
         rinse = int(job['出槽時間']) // SLOT_MIN
 
