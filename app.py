@@ -38,7 +38,7 @@ if uploaded_job and uploaded_so and uploaded_worker:
 
                 if schedule_df.empty:
                     st.warning("⚠ スケジュール可能なジョブがありません。条件を見直してください。")
-                    st.stop()
+                    
 
                 if 'StartTime' not in schedule_df.columns:
                     st.error("❌ スケジュール結果に 'StartTime' 列が存在しません。スケジューラの出力を確認してください。")
