@@ -9,13 +9,12 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
     TOTAL_SLOTS = SLOTS_PER_DAY * 7
 
-    # 槽IDごとの辞書（稼働中のみ）
+    # 稼働中の槽だけ辞書に登録
     so_dict = {row['SoID']: row for _, row in sos_df.iterrows() if row['Status'] == '稼働中'}
 
-    # 作業者スロット：全体可用性 + 各人の勤務帯・担当槽・必須槽
+    # 作業者スロットマップ
     worker_slots = {}
     global_workable_slots = [False] * TOTAL_SLOTS
-
     for _, w in workers_df.iterrows():
         wid = w['WorkerID']
         slots = [False] * TOTAL_SLOTS
@@ -26,24 +25,23 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
                 for t in range(s, e):
                     slots[t] = True
                     global_workable_slots[t] = True
-        worker_slots[wid] = {
-            'slots': slots,
-            '担当槽': str(w['担当槽']).split(',') if pd.notna(w['担当槽']) else [],
-            '必須槽': str(w['必須槽']).split(',') if pd.notna(w['必須槽']) else []
-        }
+        worker_slots[wid] = slots
 
     assigned = []
     all_intervals = []
     job_results = []
 
     for i, job in jobs_df.iterrows():
-        soak = int(float(job['入槽時間']) * 60) // SLOT_MIN
-        duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
-        rinse = int(float(job['出槽時間']) * 60) // SLOT_MIN
+        try:
+            soak = int(float(job['入槽時間']) * 60) // SLOT_MIN
+            duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
+            rinse = int(float(job['出槽時間']) * 60) // SLOT_MIN
+        except:
+            continue  # 数値変換できないものはスキップ
 
         valid_sos = [soid for soid, row in so_dict.items() if row['PlatingType'] == job['PlatingType']]
         if not valid_sos:
-            continue
+            continue  # 対応タンクなし
 
         pres = model.NewBoolVar(f"assigned_{i}")
         start = model.NewIntVar(0, TOTAL_SLOTS - soak - duration - rinse, f"start_{i}")
@@ -57,25 +55,25 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_start = plate_end
         rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        # 勤務時間外スロットにSoak/Rinseがかからないよう制約
+        # 勤務時間外でのSoak/Rinseを防ぐ
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
-        soak_range = range(t, t + soak)
-        rinse_range = range(t + soak + duration, t + soak + duration + rinse)
-        # ✅ 修正ポイント
-        combined_range = list(soak_range) + list(rinse_range)
-        if any(global_workable_slots[s] == False for s in combined_range):
-            model.Add(start != t)
-
+            soak_range = list(range(t, t + soak))
+            rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
+            combined_range = soak_range + rinse_range
+            if any(global_workable_slots[s] == False for s in combined_range):
+                model.Add(start != t)
 
         all_intervals.append((plate_int, valid_sos))
         assigned.append(pres)
         job_results.append((i, start, soak, duration, rinse, pres, job['JobID'], job['PlatingType'], valid_sos[0]))
 
+    # NoOverlap by Tank
     for soid in so_dict.keys():
         intervals = [iv for iv, soids in all_intervals if soid in soids]
         if intervals:
             model.AddNoOverlap(intervals)
 
+    # 目的：最大スケジュール数
     model.Maximize(sum(assigned))
 
     solver = cp_model.CpSolver()
