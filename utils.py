@@ -2,56 +2,79 @@ import plotly.express as px
 import pandas as pd
 from datetime import datetime, timedelta
 
-def plot_gantt(schedule_df):
+def plot_gantt(schedule_df, day_filter=None, worker_filter=None):
     if schedule_df.empty:
         return px.scatter()
 
     df = schedule_df.copy()
+    df['Start'] = pd.to_datetime(df['StartTime'])
+    df['Finish'] = df['Start'] + pd.to_timedelta(df['DurationMin'], unit='m')
+    df['DateStr'] = df['Start'].dt.strftime('%m/%d')
+    df['Hour'] = df['Start'].dt.strftime('%H:%M')
+    df['Phase'] = 'Plating'
+    df['Label'] = df['JobID'].astype(str) + " (" + df['Phase'] + ")"
 
-    # 各工程の時間を分割
-    rows = []
-    for _, row in df.iterrows():
-        start = pd.to_datetime(row["StartTime"])
-        soak = timedelta(minutes=row["SoakMin"])
-        plate = timedelta(minutes=row["DurationMin"])
-        rinse = timedelta(minutes=row["RinseMin"])
+    # Soak/Rinse対応（工程を3分割）
+    if 'SoakMin' in df.columns and 'RinseMin' in df.columns:
+        expanded = []
+        for _, row in df.iterrows():
+            base = row['Start']
+            soak = timedelta(minutes=row['SoakMin'])
+            plate = timedelta(minutes=row['DurationMin'])
+            rinse = timedelta(minutes=row['RinseMin'])
 
-        rows.append({
-            "JobID": row["JobID"],
-            "TankID": row["TankID"],
-            "Phase": "Soak",
-            "Start": start,
-            "Finish": start + soak
-        })
-        rows.append({
-            "JobID": row["JobID"],
-            "TankID": row["TankID"],
-            "Phase": "Plating",
-            "Start": start + soak,
-            "Finish": start + soak + plate
-        })
-        rows.append({
-            "JobID": row["JobID"],
-            "TankID": row["TankID"],
-            "Phase": "Rinse",
-            "Start": start + soak + plate,
-            "Finish": start + soak + plate + rinse
-        })
+            expanded += [
+                {
+                    "JobID": row["JobID"],
+                    "TankID": row["TankID"],
+                    "Phase": "Soak",
+                    "Start": base,
+                    "Finish": base + soak,
+                    "Worker": row.get("WorkerID", "N/A")
+                },
+                {
+                    "JobID": row["JobID"],
+                    "TankID": row["TankID"],
+                    "Phase": "Plating",
+                    "Start": base + soak,
+                    "Finish": base + soak + plate,
+                    "Worker": row.get("WorkerID", "N/A")
+                },
+                {
+                    "JobID": row["JobID"],
+                    "TankID": row["TankID"],
+                    "Phase": "Rinse",
+                    "Start": base + soak + plate,
+                    "Finish": base + soak + plate + rinse,
+                    "Worker": row.get("WorkerID", "N/A")
+                }
+            ]
 
-    gdf = pd.DataFrame(rows)
+        df = pd.DataFrame(expanded)
+        df['DateStr'] = df['Start'].dt.strftime('%m/%d')
+        df['Label'] = df['JobID'] + " (" + df['Phase'] + ")"
 
-    gdf["Label"] = gdf["JobID"].astype(str) + " (" + gdf["Phase"] + ")"
+    # 日付フィルタ
+    if day_filter:
+        df = df[df['DateStr'] == day_filter]
+
+    # 作業者フィルタ（将来的に使用）
+    if worker_filter:
+        df = df[df['Worker'] == worker_filter]
 
     fig = px.timeline(
-        gdf,
+        df,
         x_start="Start",
         x_end="Finish",
         y="TankID",
         color="Phase",
         hover_name="Label",
-        title="めっき工程スケジュール：ガントチャート（Soak/Plating/Rinse）"
+        title=f"めっき工程スケジュール（{day_filter if day_filter else '全体'}）"
     )
     fig.update_yaxes(autorange="reversed")
-    fig.update_layout(xaxis_title="時刻", yaxis_title="槽ID")
-
+    fig.update_layout(
+        xaxis_title="時刻",
+        yaxis_title="槽（TankID）",
+        xaxis_tickformat="%m/%d %H:%M"
+    )
     return fig
