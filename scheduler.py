@@ -61,7 +61,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
 
         # 勤務時間外にSoak/Rinseがある場合は禁止
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
-            pass
+            soak_range = list(range(t, t + soak))
+            rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
+            combined = soak_range + rinse_range
+            if not all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in combined):
+                model.Add(start != t)
 
         all_intervals.append((plate_int, valid_sos))
         assigned.append(pres)
