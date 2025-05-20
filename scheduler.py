@@ -10,13 +10,14 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
     TOTAL_SLOTS = SLOTS_PER_DAY * 7
 
-    # 稼働中の槽のみ抽出
+    # 稼働中の槽辞書（ID → row）
     so_dict = {
         str(row['SoID']).strip(): row for _, row in sos_df.iterrows()
         if str(row.get('Status', '')).strip() == '稼働中'
     }
+    all_so_ids = set(so_dict.keys())
 
-    # 作業者の勤務可能スロット
+    # 勤務可能スロット
     global_workable_slots = [False] * TOTAL_SLOTS
     for _, w in workers_df.iterrows():
         for d in range(7):
@@ -39,7 +40,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
             rinse = int(float(job['出槽時間'])) // SLOT_MIN
         except Exception as e:
-            excluded_jobs.append(f"{job_id}: 時間の変換に失敗（{e}）")
+            excluded_jobs.append(f"{job_id}: 時間変換エラー（{e}）")
             continue
 
         job_type = str(job.get('PlatingType', '')).strip()
@@ -86,9 +87,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         job_results.append((i, start, soak, duration, rinse, pres, job_id, job_type, valid_sos[0]))
 
     if not job_results:
-        st.warning("⚠ 最終的にスケジュール対象となるジョブが1件もありません。")
+        st.warning("⚠ スケジュール対象ジョブが0件です。")
         if excluded_jobs:
-            st.subheader("🛑 スケジュール除外ジョブと理由")
+            st.subheader("🛑 除外ジョブ一覧")
             for msg in excluded_jobs:
                 st.write("🔸", msg)
         return pd.DataFrame()
@@ -105,9 +106,12 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     status = solver.Solve(model)
 
     results = []
+    used_so_ids = set()
+
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         for i, start, soak, plate, rinse, pres, jid, pt, soid in job_results:
             if solver.Value(pres):
+                used_so_ids.add(soid)
                 base = solver.Value(start)
                 start_dt = start_date + timedelta(minutes=base * SLOT_MIN)
                 results.append({
@@ -120,9 +124,26 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
                     "RinseMin": rinse * SLOT_MIN
                 })
 
+    df_result = pd.DataFrame(results)
+
     if excluded_jobs:
-        st.subheader("🛑 スケジュール除外ジョブと理由")
+        st.subheader("🛑 除外されたジョブと理由")
         for msg in excluded_jobs:
             st.write("🔸", msg)
 
-    return pd.DataFrame(results)
+    if df_result.shape[0] > 0:
+        st.subheader("📊 槽使用状況診断")
+
+        used_count = df_result['TankID'].value_counts()
+        st.write("✅ 使用された槽（回数）:")
+        st.dataframe(used_count.rename_axis("TankID").reset_index(name="UsageCount"))
+
+        unused = all_so_ids - used_so_ids
+        if unused:
+            st.warning("⚠ 使用されなかった槽:")
+            for u in sorted(unused):
+                st.write(f"・{u}")
+        else:
+            st.success("🎉 すべての槽が使用されました！")
+
+    return df_result
