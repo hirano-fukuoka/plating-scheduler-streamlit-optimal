@@ -5,9 +5,9 @@ from scheduler import optimize_schedule
 from utils import plot_gantt
 import traceback
 
-st.set_page_config(page_title="めっきスケジューラ", layout="wide")
+st.set_page_config(page_title="めっき工程スケジューラ", layout="wide")
 
-st.title("🧪 めっき工程スケジューラ（Streamlit）")
+st.title("🧪 めっき工程スケジューラ（Streamlit + OR-Tools）")
 
 st.sidebar.header("📅 スケジュール条件")
 
@@ -36,35 +36,27 @@ if uploaded_job and uploaded_so and uploaded_worker:
             try:
                 schedule_df = optimize_schedule(jobs_df, workers_df, sos_df, pd.to_datetime(start_date))
 
-                if schedule_df.empty:
-                    st.warning("⚠ スケジュール可能なジョブがありません。条件を見直してください。")
-                    
+                if 'StartTime' not in schedule_df.columns or schedule_df.empty:
+                    st.warning("⚠ スケジュールが空です。診断情報をご確認ください。")
+                else:
+                    schedule_df["StartTime"] = pd.to_datetime(schedule_df["StartTime"])
+                    schedule_df["EndTime"] = schedule_df["StartTime"] + pd.to_timedelta(schedule_df["DurationMin"], unit="m")
 
-                if 'StartTime' not in schedule_df.columns:
-                    st.error("❌ スケジュール結果に 'StartTime' 列が存在しません。スケジューラの出力を確認してください。")
-                    st.write("列一覧:", schedule_df.columns.tolist())
-                    st.stop()
+                    st.subheader("📋 スケジュール一覧")
+                    st.dataframe(schedule_df)
 
-                schedule_df["StartTime"] = pd.to_datetime(schedule_df["StartTime"])
-                schedule_df["EndTime"] = schedule_df["StartTime"] + pd.to_timedelta(schedule_df["DurationMin"], unit="m")
+                    st.subheader("📊 ガントチャート")
+                    fig = plot_gantt(schedule_df)
+                    st.plotly_chart(fig, use_container_width=True)
 
-                st.subheader("📋 スケジュール一覧")
-                st.dataframe(schedule_df)
-
-                st.subheader("📊 ガントチャート表示")
-                fig = plot_gantt(schedule_df)
-                st.plotly_chart(fig, use_container_width=True)
-
-                csv = schedule_df.to_csv(index=False).encode("utf-8")
-                st.download_button("📥 スケジュールCSVダウンロード", csv, "schedule.csv", mime="text/csv")
+                    csv = schedule_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 スケジュールCSVダウンロード", csv, "schedule.csv", mime="text/csv")
 
             except Exception as e:
                 st.error(f"❌ スケジュール処理中にエラーが発生しました: {e}")
                 st.code(traceback.format_exc())
-
     except Exception as e:
         st.error(f"❌ データ読み込み時にエラーが発生しました: {e}")
         st.code(traceback.format_exc())
-
 else:
     st.info("左側から3つのCSVファイル（品物・槽・作業者）をすべてアップロードしてください。")
