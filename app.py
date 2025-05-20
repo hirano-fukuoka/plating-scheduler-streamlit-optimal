@@ -17,7 +17,7 @@ start_date = st.date_input("📅 スケジュール開始日", value=date.today(
 
 # ファイルアップロード
 st.subheader("📤 入力CSVのアップロード")
-uploaded_jobs = st.file_uploader("📦 品物リストCSV（JobID, PlatingType, PlatingMin, 入槽時間, 出槽時間）", type="csv")
+uploaded_jobs = st.file_uploader("📦 品物リストCSV（JobID, PlatingType, PlatingMin[hr], 入槽時間[hr], 出槽時間[hr]）", type="csv")
 uploaded_workers = st.file_uploader("👷‍♂️ 作業者リストCSV（勤務帯・出勤・担当槽など）", type="csv")
 uploaded_sos = st.file_uploader("🛢 槽リストCSV（SoID, 種類, PlatingType, 稼働状態）", type="csv")
 
@@ -34,15 +34,21 @@ if st.button("🚀 スケジュール最適化を実行") and uploaded_jobs and 
         st.subheader("📋 スケジュール一覧")
         st.dataframe(schedule_df)
 
-        st.subheader("🗂 ガントチャート表示")
-        fig = plot_gantt(schedule_df)
+        # MM/DD形式のユニーク日付抽出
+        schedule_df["StartTime"] = pd.to_datetime(schedule_df["StartTime"])
+        unique_days = sorted(schedule_df['StartTime'].dt.strftime('%m/%d').unique())
+
+        st.subheader("🗂 ガントチャート（日別表示）")
+        selected_day = st.selectbox("📆 表示する日付（MM/DD）", unique_days)
+
+        fig = plot_gantt(schedule_df, day_filter=selected_day)
         st.plotly_chart(fig, use_container_width=True)
 
+        # ダウンロード
         csv = schedule_df.to_csv(index=False).encode("utf-8")
         st.download_button("📥 スケジュールCSVダウンロード", csv, "schedule.csv", mime="text/csv")
 
     except Exception as e:
         st.error(f"❌ スケジューリング中にエラーが発生しました: {e}")
-
 else:
     st.info("⬆️ 上の3つのCSVファイルをすべてアップロードしてください")
