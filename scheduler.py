@@ -129,8 +129,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             soak_w = job['SoakWorker']
             rinse_w = job['RinseWorker']
 
-            # Soakスロット中なら追加
-            model.AddImplication(pres, s + soak > t).OnlyEnforceIf(pres)
+            is_after_soak = model.NewBoolVar(f"after_soak_{i}_{t}")
+            model.Add(s + soak > t).OnlyEnforceIf(is_after_soak)
+            model.Add(s + soak <= t).OnlyEnforceIf(is_after_soak.Not())
+            model.AddImplication(pres, is_after_soak)
             if t >= 0:
                 if_slot_in_soak = model.NewBoolVar(f"soak_active_{i}_{t}")
                 model.Add(t >= s).OnlyEnforceIf(if_slot_in_soak)
