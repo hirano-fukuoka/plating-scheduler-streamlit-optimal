@@ -33,9 +33,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
 
     for i, job in jobs_df.iterrows():
         try:
-            soak = int(float(job['入槽時間']) * 60) // SLOT_MIN
+            soak = int(float(job['入槽時間']) ) // SLOT_MIN
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
-            rinse = int(float(job['出槽時間']) * 60) // SLOT_MIN
+            rinse = int(float(job['出槽時間']) ) // SLOT_MIN
         except:
             continue  # 数値変換失敗時スキップ
 
