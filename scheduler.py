@@ -67,8 +67,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         ]
 
         if not valid_sos:
-            excluded_jobs.append(f"{job_id}: PlatingType='{job_type}' + RequiredSoType='{required_type}' に一致する槽なし")
+            excluded_jobs.append(
+                f"{job_id}: ❌ 対応槽なし → PlatingType='{job_type}', RequiredSoType='{required_type}' に一致する槽がありません"
+            )
             continue
+
 
         soid = valid_sos[0]
         row = so_dict[soid]
@@ -98,8 +101,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             else:
                 model.Add(start != t)
         if restricted:
-            excluded_jobs.append(f"{job_id}: 勤務時間外により処理スロットが確保できません")
+            excluded_jobs.append(
+                f"{job_id}: ❌ 勤務帯外 → Soak+Rinse が出勤時間に収まりません"
+            )
             continue
+
 
         # 各スロットに作業者需要を積み上げ（AddPresenceリスク回避のため記録のみ）
         job_results.append({
@@ -165,7 +171,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             for job in job_results:
                 i = job['index']
                 pres = job['pres']
-                if solver.Value(pres):
+                if solver.Value(pres) == 0:
+                    excluded_jobs.append(
+                        f"{job['JobID']}: ⚠ 候補にはなったが最適化で未採用 → タンクや人数競合の可能性"
+                    )
+
                     start_val = solver.Value(job['start'])
                     used_so_ids.add(job['TankID'])
     
@@ -189,9 +199,14 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         df_result = pd.DataFrame(results)
     
         if excluded_jobs:
-            st.subheader("🛑 除外されたジョブと理由")
+            st.subheader("🛑 除外ジョブ一覧（理由つき）")
             for msg in excluded_jobs:
-                st.write("🔸", msg)
+                if "❌" in msg:
+                    st.error(msg)
+                elif "⚠" in msg:
+                    st.warning(msg)
+                else:
+                    st.write("🔹", msg)
     
         if df_result.shape[0] > 0:
             st.subheader("📊 槽使用状況")
