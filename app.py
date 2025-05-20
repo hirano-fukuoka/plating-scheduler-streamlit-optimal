@@ -40,16 +40,16 @@ if uploaded_job and uploaded_so and uploaded_worker:
                     st.warning("⚠ スケジュール可能なジョブがありません。条件を見直してください。")
                     st.stop()
 
-                st.subheader("📋 スケジュール一覧")
-                st.dataframe(schedule_df)
-
                 if 'StartTime' not in schedule_df.columns:
                     st.error("❌ スケジュール結果に 'StartTime' 列が存在しません。スケジューラの出力を確認してください。")
+                    st.write("列一覧:", schedule_df.columns.tolist())
                     st.stop()
 
-                # ガントチャート用の前処理
                 schedule_df["StartTime"] = pd.to_datetime(schedule_df["StartTime"])
                 schedule_df["EndTime"] = schedule_df["StartTime"] + pd.to_timedelta(schedule_df["DurationMin"], unit="m")
+
+                st.subheader("📋 スケジュール一覧")
+                st.dataframe(schedule_df)
 
                 st.subheader("📊 ガントチャート表示")
                 fig = plot_gantt(schedule_df)
@@ -59,8 +59,12 @@ if uploaded_job and uploaded_so and uploaded_worker:
                 st.download_button("📥 スケジュールCSVダウンロード", csv, "schedule.csv", mime="text/csv")
 
             except Exception as e:
-                st.error(f"❌ スケジューリング中にエラーが発生しました: {e}")
+                st.error(f"❌ スケジュール処理中にエラーが発生しました: {e}")
                 st.code(traceback.format_exc())
+
+    except Exception as e:
+        st.error(f"❌ データ読み込み時にエラーが発生しました: {e}")
+        st.code(traceback.format_exc())
 
 else:
     st.info("左側から3つのCSVファイル（品物・槽・作業者）をすべてアップロードしてください。")
