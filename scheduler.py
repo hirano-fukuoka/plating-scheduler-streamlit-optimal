@@ -12,7 +12,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     # 槽IDごとのPlatingType対応辞書
     so_dict = {row['SoID']: row for _, row in sos_df.iterrows() if row['Status'] == '稼働中'}
 
-    # 作業者可用性マップ：worker_id -> [bool x 336]
+    # 作業者可用性マップ
     worker_slots = {}
     for _, w in workers_df.iterrows():
         wid = w['WorkerID']
@@ -38,52 +38,30 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         soak = int(job['入槽時間']) // SLOT_MIN
         rinse = int(job['出槽時間']) // SLOT_MIN
 
-        # 使用可能な槽候補（PlatingType一致＋稼働中）
+        # 使用可能な槽候補
         valid_sos = [soid for soid, row in so_dict.items() if row['PlatingType'] == job['PlatingType']]
-
         if not valid_sos:
-            continue  # 対応可能な槽なし
+            continue
+
+        # Presenceフラグ（このジョブを使うか）
+        pres = model.NewBoolVar(f"assigned_{i}")
 
         start = model.NewIntVar(0, TOTAL_SLOTS - soak - duration - rinse, f"start_{i}")
-        soak_int = model.NewIntervalVar(start, soak, start + soak, f"soak_{i}")
-        plate_start = model.NewIntVar(0, TOTAL_SLOTS, f"plate_start_{i}")
-        model.Add(plate_start == start + soak)
-        plate_int = model.NewIntervalVar(plate_start, duration, plate_start + duration, f"plate_{i}")
-        rinse_start = model.NewIntVar(0, TOTAL_SLOTS, f"rinse_start_{i}")
-        model.Add(rinse_start == plate_start + duration)
-        rinse_int = model.NewIntervalVar(rinse_start, rinse, rinse_start + rinse, f"rinse_{i}")
+        soak_end = model.NewIntVar(0, TOTAL_SLOTS, f"soak_end_{i}")
+        plate_end = model.NewIntVar(0, TOTAL_SLOTS, f"plate_end_{i}")
+        rinse_end = model.NewIntVar(0, TOTAL_SLOTS, f"rinse_end_{i}")
 
-        pres = model.NewBoolVar(f"assigned_{i}")
-        model.AddPresenceOf(soak_int, pres)
-        model.AddPresenceOf(plate_int, pres)
-        model.AddPresenceOf(rinse_int, pres)
+        soak_int = model.NewOptionalIntervalVar(start, soak, soak_end, pres, f"soak_{i}")
+        plate_start = soak_end
+        plate_int = model.NewOptionalIntervalVar(plate_start, duration, plate_end, pres, f"plate_{i}")
+        rinse_start = plate_end
+        rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        all_intervals.append((plate_int, valid_sos))  # only plating blocks槽重複
-
-        # 人員制約：Soak / Rinse に最低人数（2人）必要
-        for seg, label in [(soak_int, 'Soak'), (rinse_int, 'Rinse')]:
-            for wid, wdict in worker_slots.items():
-                if job['PlatingType'] in ['Ni', 'Cr', 'Zn']:  # 仮ルール
-                    required = 2 if 'BL' not in valid_sos[0] else 3
-                    cond = [
-                        model.NewBoolVar(f"{label}_{i}_{wid}_{s}") for s in range(TOTAL_SLOTS)
-                    ]
-                    active = []
-                    for s in range(TOTAL_SLOTS):
-                        if wdict['slots'][s] and valid_sos[0] in wdict['担当槽']:
-                            active.append(model.NewBoolVar(f"use_{i}_{wid}_{s}"))
-                    # 下限を満たす人数がいるかどうかは簡略処理で別途近似チェックでも良い（高速化目的）
-
-        # 特定作業者必須条件（例：BL槽）
-        for wid, wdict in worker_slots.items():
-            if valid_sos[0] in wdict['必須槽']:
-                # 作業者 wid が soak_start～rinse_end まで空いていることを条件とする
-                pass  # 実装省略中（強化時に追加）
-
+        all_intervals.append((plate_int, valid_sos))
         assigned.append(pres)
         job_results.append((i, start, soak, duration, rinse, pres, job['JobID'], job['PlatingType'], valid_sos[0]))
 
-    # 槽のNoOverlap制約
+    # 槽別NoOverlap制約
     for soid in so_dict.keys():
         intervals = [iv for iv, soids in all_intervals if soid in soids]
         if intervals:
