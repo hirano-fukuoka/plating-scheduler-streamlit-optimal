@@ -1,6 +1,7 @@
 from ortools.sat.python import cp_model
 import pandas as pd
 from datetime import timedelta
+import streamlit as st
 
 def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     model = cp_model.CpModel()
@@ -12,14 +13,14 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     # 稼働中の槽のみ
     so_dict = {
         row['SoID']: row for _, row in sos_df.iterrows()
-        if row.get('Status', '稼働中') == '稼働中'
+        if str(row.get('Status')).strip() == '稼働中'
     }
 
-    # 作業者スロット定義
+    # 作業スロット定義
     global_workable_slots = [False] * TOTAL_SLOTS
     for _, w in workers_df.iterrows():
         for d in range(7):
-            if w.get(f'Day{d+1}', '') == '〇':
+            if str(w.get(f'Day{d+1}', '')).strip() == '〇':
                 s = int(float(w['StartHour']) * 2) + d * SLOTS_PER_DAY
                 e = int(float(w['EndHour']) * 2) + d * SLOTS_PER_DAY
                 for t in range(s, e):
@@ -28,23 +29,30 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     assigned = []
     all_intervals = []
     job_results = []
+    excluded_jobs = []
 
     for i, job in jobs_df.iterrows():
+        job_id = str(job.get('JobID', f"job_{i}"))
+
         try:
             soak = int(float(job['入槽時間'])) // SLOT_MIN
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
             rinse = int(float(job['出槽時間'])) // SLOT_MIN
-        except:
+        except Exception as e:
+            excluded_jobs.append(f"{job_id}: 時間の変換に失敗（{e}）")
             continue
 
-        # 槽タイプ指定によるフィルタ（RequiredSoType列がある場合のみ適用）
         required_type = str(job.get('RequiredSoType', '')).strip()
+        job_type = str(job.get('PlatingType', '')).strip()
+
         valid_sos = [
             soid for soid, row in so_dict.items()
-            if row['PlatingType'] == job['PlatingType'] and
+            if job_type in str(row['PlatingType']) and
                (required_type == '' or row.get('SoType', '') == required_type)
         ]
+
         if not valid_sos:
+            excluded_jobs.append(f"{job_id}: PlatingType='{job_type}' + RequiredSoType='{required_type}' に一致する槽なし")
             continue
 
         pres = model.NewBoolVar(f"assigned_{i}")
@@ -59,20 +67,33 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_start = plate_end
         rinse_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_{i}")
 
-        # 勤務時間外にSoak/Rinseがある場合は禁止
+        # 勤務時間外配置制限
+        restricted = True
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
             combined = soak_range + rinse_range
-            if not all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in combined):
+            if all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in combined):
+                restricted = False
+            else:
                 model.Add(start != t)
+
+        if restricted:
+            excluded_jobs.append(f"{job_id}: 勤務時間外により処理スロットが確保できません")
+            continue
 
         all_intervals.append((plate_int, valid_sos))
         assigned.append(pres)
-        job_results.append((i, start, soak, duration, rinse, pres,
-                            job['JobID'], job['PlatingType'], valid_sos[0]))
+        job_results.append((i, start, soak, duration, rinse, pres, job_id, job_type, valid_sos[0]))
 
-    # 各槽ごとに NoOverlap 制約
+    if not job_results:
+        st.warning("⚠ 最終的にスケジュール対象となるジョブが1件もありません。")
+        if excluded_jobs:
+            st.subheader("🛑 スケジュール除外ジョブと理由")
+            for msg in excluded_jobs:
+                st.write("🔸", msg)
+        return pd.DataFrame()
+
     for soid in so_dict.keys():
         intervals = [iv for iv, soids in all_intervals if soid in soids]
         if intervals:
@@ -99,5 +120,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
                     "SoakMin": soak * SLOT_MIN,
                     "RinseMin": rinse * SLOT_MIN
                 })
+
+    if excluded_jobs:
+        st.subheader("🛑 スケジュール除外ジョブと理由")
+        for msg in excluded_jobs:
+            st.write("🔸", msg)
 
     return pd.DataFrame(results)
