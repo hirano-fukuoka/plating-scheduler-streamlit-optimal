@@ -26,28 +26,20 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     }
     all_so_ids = set(so_dict.keys())
 
-    early_worker_ids = [w['WorkerID'] for _, w in workers_df.iterrows() if '早番' in str(w['勤務帯'])]
-    late_worker_ids  = [w['WorkerID'] for _, w in workers_df.iterrows() if '遅番' in str(w['勤務帯'])]
-
     worker_slots = {}
     worker_total_slots = {}
     for _, w in workers_df.iterrows():
         wid = w['WorkerID']
         slots = [False] * TOTAL_SLOTS
-        total = 0
         for d in range(7):
             if str(w.get(f'Day{d+1}', '')).strip() == '〇':
                 for week in range(MAX_WEEKS):
                     s = int(float(w['StartHour']) * 2) + d * SLOTS_PER_DAY + week * SLOTS_PER_WEEK
                     e = int(float(w['EndHour']) * 2) + d * SLOTS_PER_DAY + week * SLOTS_PER_WEEK
-                    total += (e - s)
                     for t in range(s, e):
                         slots[t] = True
         worker_slots[wid] = slots
-        worker_total_slots[wid] = total
 
-    early_slot = [any(worker_slots[w][t] for w in early_worker_ids) for t in range(TOTAL_SLOTS)]
-    late_slot  = [any(worker_slots[w][t] for w in late_worker_ids)  for t in range(TOTAL_SLOTS)]
     global_workable_slots = [any(worker_slots[w][t] for w in worker_slots) for t in range(TOTAL_SLOTS)]
     slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
 
@@ -99,13 +91,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
                     soak_found = True
                     break
             if not soak_found:
-                continue  # 他タンク候補を探す
+                continue
 
             plating_start = soak_start + soak
             plating_end = plating_start + duration
             rinse_start = find_first_workable_rinse_start(plating_end, rinse, global_workable_slots)
             if rinse_start is None:
-                continue  # 他タンク候補を探す
+                continue
 
             pres = model.NewBoolVar(f"assigned_{i}_{soid}")
             pres_vars.append(pres)
@@ -137,13 +129,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
                 "Reason": f"{job_id}: ❌ いずれのタンクでも勤務帯・リソース等の都合で割り当て不可"
             })
             continue
-        # 「どこか1タンクだけpres=1」
         model.Add(sum(pres_vars) <= 1)
         assigned.extend(pres_vars)
         job_results.extend(alt_results)
-
-    solver = cp_model.CpSolver()
-    status = cp_model.UNKNOWN
 
     # 各タンクごとにNoOverlap
     for soid in so_dict:
@@ -174,57 +162,16 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # 早番・遅番負荷バランス
-    early_load = model.NewIntVar(0, 100000, "early_load")
-    late_load  = model.NewIntVar(0, 100000, "late_load")
-    early_slot_used = []
-    late_slot_used  = []
-    for t in range(TOTAL_SLOTS):
-        early_slot_bool = model.NewBoolVar(f"early_slot_{t}")
-        late_slot_bool  = model.NewBoolVar(f"late_slot_{t}")
-        overlap_expr_early = []
-        overlap_expr_late  = []
-        for job in job_results:
-            soak_start = job['start']
-            soak = job['soak']
-            rinse_start = job['rinse_start']
-            rinse = job['rinse']
-            pres = job['pres']
-            if early_slot[t]:
-                if t >= soak_start and t < soak_start + soak:
-                    overlap_expr_early.append(pres)
-                if t >= rinse_start and t < rinse_start + rinse:
-                    overlap_expr_early.append(pres)
-            if late_slot[t]:
-                if t >= soak_start and t < soak_start + soak:
-                    overlap_expr_late.append(pres)
-                if t >= rinse_start and t < rinse_start + rinse:
-                    overlap_expr_late.append(pres)
-        if overlap_expr_early:
-            model.AddBoolOr(overlap_expr_early).OnlyEnforceIf(early_slot_bool)
-            model.AddBoolAnd([~x for x in overlap_expr_early]).OnlyEnforceIf(early_slot_bool.Not())
-        else:
-            model.Add(early_slot_bool == 0)
-        if overlap_expr_late:
-            model.AddBoolOr(overlap_expr_late).OnlyEnforceIf(late_slot_bool)
-            model.AddBoolAnd([~x for x in overlap_expr_late]).OnlyEnforceIf(late_slot_bool.Not())
-        else:
-            model.Add(late_slot_bool == 0)
-        early_slot_used.append(early_slot_bool)
-        late_slot_used.append(late_slot_bool)
-    model.Add(early_load == sum(early_slot_used))
-    model.Add(late_load == sum(late_slot_used))
-    load_diff = model.NewIntVar(0, 100000, "load_diff")
-    model.AddAbsEquality(load_diff, early_load - late_load)
-    model.Maximize(1000 * sum(assigned) - load_diff)
+    # === 目的関数は「ジョブ数最大化」のみ！ ===
+    model.Maximize(sum(assigned))
+
+    solver = cp_model.CpSolver()
+    status = cp_model.UNKNOWN
 
     if job_results:
         status = solver.Solve(model)
 
     results = []
-    used_so_ids = set()
-    slot_usage_map = [0] * TOTAL_SLOTS
-
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         for job in job_results:
             pres = job['pres']
@@ -234,12 +181,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             plating_start = soak_start + job['soak']
             plating_end = plating_start + job['duration']
             rinse_start = job['rinse_start']
-
-            used_so_ids.add(job['TankID'])
-            for t in range(soak_start, soak_start + job['soak']):
-                slot_usage_map[t] += 1
-            for t in range(rinse_start, rinse_start + job['rinse']):
-                slot_usage_map[t] += 1
 
             start_dt = start_date + timedelta(minutes=soak_start * SLOT_MIN)
             plating_end_dt = start_date + timedelta(minutes=plating_end * SLOT_MIN)
