@@ -45,14 +45,26 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     for i, job in jobs_df.iterrows():
         job_id = str(job.get('JobID', f"job_{i}")).strip()
         try:
-            soak = int(float(job['入槽時間'])) // SLOT_MIN
-            duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
-            rinse = int(float(job['出槽時間'])) // SLOT_MIN
+            plating_min_raw = job['PlatingMin']
+            soak_time_raw = job['入槽時間']
+            rinse_time_raw = job['出槽時間']
+        
+            if pd.isna(plating_min_raw) or str(plating_min_raw).strip() == "":
+                raise ValueError("PlatingMin is empty")
+            if pd.isna(soak_time_raw) or str(soak_time_raw).strip() == "":
+                raise ValueError("入槽時間 is empty")
+            if pd.isna(rinse_time_raw) or str(rinse_time_raw).strip() == "":
+                raise ValueError("出槽時間 is empty")
+        
+            soak = int(float(str(soak_time_raw).strip())) // SLOT_MIN
+            duration = int(float(str(plating_min_raw).strip()) * 60) // SLOT_MIN
+            rinse = int(float(str(rinse_time_raw).strip())) // SLOT_MIN
+        
         except Exception as e:
             excluded_jobs.append({
                 "JobID": job_id,
                 "Category": "time_parse_error",
-                "Reason": f"{job_id}: 時間変換エラー - {e}"
+                "Reason": f"{job_id}: ❌ 時間変換エラー - {e}"
             })
             continue
 
