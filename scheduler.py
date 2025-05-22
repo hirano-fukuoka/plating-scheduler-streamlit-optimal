@@ -224,7 +224,8 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
 
     # --- 目的関数：ジョブ数最大化＋早番遅番負荷差最小化（加重式） ---
     load_diff = model.NewIntVar(0, 100000, "load_diff")
-    model.Add(load_diff == abs(early_load - late_load))
+    model.AddAbsEquality(load_diff, early_load - late_load)
+
     # 係数（1000）は現場に合わせて調整。大きいほど「まずジョブ数最大化優先」
     model.Maximize(1000 * sum(assigned) - load_diff)
 
