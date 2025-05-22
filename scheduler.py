@@ -28,6 +28,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     }
     all_so_ids = set(so_dict.keys())
 
+    # 早番・遅番グループ分け
+    early_worker_ids = [w['WorkerID'] for _, w in workers_df.iterrows() if '早番' in str(w['勤務帯'])]
+    late_worker_ids  = [w['WorkerID'] for _, w in workers_df.iterrows() if '遅番' in str(w['勤務帯'])]
+
     worker_slots = {}
     worker_total_slots = {}
     for _, w in workers_df.iterrows():
@@ -44,6 +48,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
                         slots[t] = True
         worker_slots[wid] = slots
         worker_total_slots[wid] = total
+
+    # 早番・遅番のスロット可用性配列
+    early_slot = [any(worker_slots[w][t] for w in early_worker_ids) for t in range(TOTAL_SLOTS)]
+    late_slot  = [any(worker_slots[w][t] for w in late_worker_ids)  for t in range(TOTAL_SLOTS)]
 
     global_workable_slots = [any(worker_slots[w][t] for w in worker_slots) for t in range(TOTAL_SLOTS)]
     slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
@@ -86,7 +94,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         soak_workers = int(row.get('SoakWorker', 1))
         rinse_workers = int(row.get('RinseWorker', 1))
 
-        # Soak工程の開始スロット（勤務帯内で可能なものを探す）
         soak_found = False
         for t in range(VALID_START_MIN, VALID_START_MAX + 1):
             soak_range = list(range(t, t + soak))
@@ -105,7 +112,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         plating_start = soak_start + soak
         plating_end = plating_start + duration
 
-        # RinseはPlating終了後、勤務帯が再開するまで待機
         rinse_start = find_first_workable_rinse_start(plating_end, rinse, global_workable_slots)
         if rinse_start is None:
             excluded_jobs.append({
@@ -115,7 +121,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             })
             continue
 
-        # OR-Tools変数で工程配置
         start = model.NewIntVar(soak_start, soak_start, f"start_{i}")
         pres = model.NewBoolVar(f"assigned_{i}")
 
@@ -141,11 +146,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         })
         assigned.append(pres)
 
-    # OR-Toolsモデルが空だとエラーになるので、必ずSolve前にモデル構築
     solver = cp_model.CpSolver()
-    status = cp_model.UNKNOWN  # 初期値
+    status = cp_model.UNKNOWN
 
-    # NoOverlapなどの制約追加
     for soid in so_dict:
         intervals = []
         for job in job_results:
@@ -158,7 +161,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # 作業者リソース制約（Soak/Rinseのみ）
     for t in range(TOTAL_SLOTS):
         demand_expr = []
         for job in job_results:
@@ -167,20 +169,65 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             rinse_start = job['rinse_start']
             rinse = job['rinse']
             pres = job['pres']
-            # Soak
             if t >= soak_start and t < soak_start + soak:
                 demand_expr.append(job['SoakWorker'])
-            # Rinse
             if t >= rinse_start and t < rinse_start + rinse:
                 demand_expr.append(job['RinseWorker'])
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # 優先度付き最大化
-    priority_weights = [len(assigned) - i for i in range(len(assigned))]
-    model.Maximize(sum(priority_weights[i] * assigned[i] for i in range(len(assigned))))
+    # --- 早番・遅番の負荷スロット合計を集計 ---
+    early_load = model.NewIntVar(0, 100000, "early_load")
+    late_load  = model.NewIntVar(0, 100000, "late_load")
 
-    # ここで必ずSolveし、statusに値をセット
+    early_slot_used = []
+    late_slot_used  = []
+
+    for t in range(TOTAL_SLOTS):
+        early_slot_bool = model.NewBoolVar(f"early_slot_{t}")
+        late_slot_bool  = model.NewBoolVar(f"late_slot_{t}")
+        # どのジョブかがpres=1かつSoak/Rinseでそのスロットに重なり、かつその枠が早番/遅番に該当すれば1
+        overlap_expr_early = []
+        overlap_expr_late  = []
+        for job in job_results:
+            soak_start = job['start']
+            soak = job['soak']
+            rinse_start = job['rinse_start']
+            rinse = job['rinse']
+            pres = job['pres']
+            if early_slot[t]:
+                if t >= soak_start and t < soak_start + soak:
+                    overlap_expr_early.append(pres)
+                if t >= rinse_start and t < rinse_start + rinse:
+                    overlap_expr_early.append(pres)
+            if late_slot[t]:
+                if t >= soak_start and t < soak_start + soak:
+                    overlap_expr_late.append(pres)
+                if t >= rinse_start and t < rinse_start + rinse:
+                    overlap_expr_late.append(pres)
+        # 何か1つでもpres=1なら、そのスロットは使われたとみなす
+        if overlap_expr_early:
+            model.AddBoolOr(overlap_expr_early).OnlyEnforceIf(early_slot_bool)
+            model.AddBoolAnd([~x for x in overlap_expr_early]).OnlyEnforceIf(early_slot_bool.Not())
+        else:
+            model.Add(early_slot_bool == 0)
+        if overlap_expr_late:
+            model.AddBoolOr(overlap_expr_late).OnlyEnforceIf(late_slot_bool)
+            model.AddBoolAnd([~x for x in overlap_expr_late]).OnlyEnforceIf(late_slot_bool.Not())
+        else:
+            model.Add(late_slot_bool == 0)
+        early_slot_used.append(early_slot_bool)
+        late_slot_used.append(late_slot_bool)
+
+    model.Add(early_load == sum(early_slot_used))
+    model.Add(late_load == sum(late_slot_used))
+
+    # --- 目的関数：ジョブ数最大化＋早番遅番負荷差最小化（加重式） ---
+    load_diff = model.NewIntVar(0, 100000, "load_diff")
+    model.Add(load_diff == abs(early_load - late_load))
+    # 係数（1000）は現場に合わせて調整。大きいほど「まずジョブ数最大化優先」
+    model.Maximize(1000 * sum(assigned) - load_diff)
+
     if job_results:
         status = solver.Solve(model)
 
@@ -228,7 +275,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
 
     df_result = pd.DataFrame(results)
 
-    # 除外ジョブの表示・分析
+    # --- UI表示部分は従来通り ---
     if excluded_jobs:
         st.subheader("🛑 除外ジョブ一覧（理由つき）")
         for entry in excluded_jobs:
@@ -285,4 +332,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             used = sum(1 for t in range(TOTAL_SLOTS) if worker_slots[wid][t] and slot_usage_map[t] > 0)
             rate = 100 * used / total if total else 0
             st.write(f"👷 {wid}: {used} / {total} スロット → {rate:.1f} %")
+        # 早番・遅番の合計負荷も表示
+        st.subheader("早番・遅番グループ負荷")
+        st.write(f"早番スロット合計: {solver.Value(early_load)}")
+        st.write(f"遅番スロット合計: {solver.Value(late_load)}")
+        st.write(f"差分: {solver.Value(early_load) - solver.Value(late_load)}")
     return df_result
