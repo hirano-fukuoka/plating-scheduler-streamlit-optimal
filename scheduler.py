@@ -2,6 +2,7 @@ from ortools.sat.python import cp_model
 import pandas as pd
 from datetime import timedelta
 import streamlit as st
+import plotly.express as px
 
 def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     model = cp_model.CpModel()
@@ -54,7 +55,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
             rinse = int(float(job['出槽時間'])) // SLOT_MIN
         except Exception as e:
-            excluded_jobs.append(f"{job_id}: 時間変換エラー（{e}）")
+            excluded_jobs.append({
+                "JobID": job_id,
+                "Category": "time_conversion_error",
+                "Reason": f"{job_id}: ❌ 時間変換エラー（{e}）"
+            })
             continue
 
         job_type = str(job.get('PlatingType', '')).strip()
@@ -67,9 +72,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         ]
 
         if not valid_sos:
-            excluded_jobs.append(
-                f"{job_id}: ❌ 対応槽なし → PlatingType='{job_type}', RequiredSoType='{required_type}' に一致する槽がありません"
-            )
+            excluded_jobs.append({
+                "JobID": job_id,
+                "Category": "type_unmatched",
+                "Reason": f"{job_id}: ❌ 対応槽なし → PlatingType='{job_type}', RequiredSoType='{required_type}' に一致する槽がありません"
+            })
             continue
 
         soid = valid_sos[0]
@@ -78,24 +85,21 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         rinse_workers = int(row.get('RinseWorker', 1))
 
         pres = model.NewBoolVar(f"assigned_{i}")
-        # 開始変数
         start = model.NewIntVar(0, TOTAL_SLOTS - soak - duration - rinse, f"start_{i}")
         soak_end = model.NewIntVar(0, TOTAL_SLOTS, f"soak_end_{i}")
         plate_end = model.NewIntVar(0, TOTAL_SLOTS, f"plate_end_{i}")
         rinse_end = model.NewIntVar(0, TOTAL_SLOTS, f"rinse_end_{i}")
 
-        # ====== 人のインターバル（Soak・Rinseのみ） ======
         soak_worker_int = model.NewOptionalIntervalVar(start, soak, soak_end, pres, f"soak_worker_{i}")
         rinse_start = plate_end
         rinse_worker_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_worker_{i}")
 
-        # ====== 槽のインターバル（Soak・Plating・Rinseすべて） ======
         soak_tank_int = model.NewOptionalIntervalVar(start, soak, soak_end, pres, f"soak_tank_{i}")
         plate_start = soak_end
         plate_int = model.NewOptionalIntervalVar(plate_start, duration, plate_end, pres, f"plate_{i}")
         rinse_tank_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_tank_{i}")
 
-        # ====== Soak/Rinse の勤務帯チェック（人） ======
+        # Soak/Rinse の勤務帯チェック（人）
         restricted = True
         for t in range(TOTAL_SLOTS - soak - duration - rinse):
             soak_range = list(range(t, t + soak))
@@ -106,12 +110,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             else:
                 model.Add(start != t)
         if restricted:
-            excluded_jobs.append(
-                f"{job_id}: ❌ 勤務帯外 → Soak+Rinse が出勤時間に収まりません"
-            )
+            excluded_jobs.append({
+                "JobID": job_id,
+                "Category": "out_of_shift",
+                "Reason": f"{job_id}: ❌ 勤務帯外 → Soak+Rinse が出勤時間に収まりません"
+            })
             continue
 
-        # ====== job_resultsに全リソースのインターバルを記録 ======
         job_results.append({
             'index': i, 'start': start, 'soak': soak, 'duration': duration, 'rinse': rinse,
             'pres': pres, 'JobID': job_id, 'PlatingType': job_type, 'TankID': soid,
@@ -125,7 +130,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
 
         assigned.append(pres)
 
-    # ====== 槽NoOverlap制約（同じタンクは重複不可：Soak/Plating/Rinse） ======
+    # 槽NoOverlap制約（Soak/Plating/Rinse重複不可）
     for soid in so_dict:
         intervals = []
         for job in job_results:
@@ -138,7 +143,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # ====== 作業者リソース制約（Soak/Rinse工程の各スロットごと人数制約） ======
+    # 作業者リソース制約（Soak/Rinse工程の各スロットごと人数制約）
     for t in range(TOTAL_SLOTS):
         demand_expr = []
         for job in job_results:
@@ -149,13 +154,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             rinse = job['rinse']
             soak_w = job['SoakWorker']
             rinse_w = job['RinseWorker']
-            # Soak時間
             is_in_soak = model.NewBoolVar(f"soak_active_{i}_{t}")
             model.Add(t >= s).OnlyEnforceIf(is_in_soak)
             model.Add(t < s + soak).OnlyEnforceIf(is_in_soak)
             model.Add(is_in_soak == 1).OnlyEnforceIf(pres)
             demand_expr.append(is_in_soak * soak_w)
-            # Rinse時間
             rinse_start = s + soak + job['duration']
             is_in_rinse = model.NewBoolVar(f"rinse_active_{i}_{t}")
             model.Add(t >= rinse_start).OnlyEnforceIf(is_in_rinse)
@@ -165,7 +168,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # ====== 目的関数 ======
+    # 目的関数
     model.Maximize(sum(assigned))
 
     solver = cp_model.CpSolver()
@@ -181,15 +184,15 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             i = job['index']
             pres = job['pres']
             if solver.Value(pres) == 0:
-                excluded_jobs.append(
-                    f"{job['JobID']}: ⚠ 候補にはなったが最適化で未採用 → タンクや人数競合の可能性"
-                )
+                excluded_jobs.append({
+                    "JobID": job['JobID'],
+                    "Category": "tank_or_worker_conflict",
+                    "Reason": f"{job['JobID']}: ⚠ 候補にはなったが最適化で未採用 → タンクや人数競合の可能性"
+                })
                 continue
 
             start_val = solver.Value(job['start'])
             used_so_ids.add(job['TankID'])
-
-            # Soak + Rinse のスロットにカウント（作業者負荷分析用）
             for t in range(start_val, start_val + job['soak']):
                 slot_usage_map[t] += 1
             for t in range(start_val + job['soak'] + job['duration'], start_val + job['soak'] + job['duration'] + job['rinse']):
@@ -208,28 +211,30 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
 
     df_result = pd.DataFrame(results)
 
+    # 除外ジョブの表示・分析
     if excluded_jobs:
         st.subheader("🛑 除外ジョブ一覧（理由つき）")
-        for msg in excluded_jobs:
-            if "❌" in msg:
-                st.error(msg)
-            elif "⚠" in msg:
-                st.warning(msg)
+        for entry in excluded_jobs:
+            reason = entry["Reason"]
+            if "❌" in reason:
+                st.error(reason)
+            elif "⚠" in reason:
+                st.warning(reason)
             else:
-                st.write("🔹", msg)
-        # 除外ジョブのCSVダウンロード機能
-        log_entries = []
-        for msg in excluded_jobs:
-            if "❌" in msg:
-                level = "ERROR"
-            elif "⚠" in msg:
-                level = "WARNING"
-            else:
-                level = "INFO"
-            job_id, reason = msg.split(":", 1)
-            log_entries.append({"JobID": job_id.strip(), "Level": level, "Reason": reason.strip()})
-        df_log = pd.DataFrame(log_entries)
-        csv_log = df_log.to_csv(index=False).encode("utf-8")
+                st.write("🔹", reason)
+
+        # DataFrame化しカテゴリごとに集計
+        df_excl = pd.DataFrame(excluded_jobs)
+        reason_summary = df_excl['Category'].value_counts().reset_index()
+        reason_summary.columns = ['除外理由カテゴリ', '件数']
+        st.subheader("📝 除外理由ごとの集計")
+        st.dataframe(reason_summary)
+        # 円グラフ
+        fig = px.pie(reason_summary, names='除外理由カテゴリ', values='件数', title="除外ジョブ理由の割合")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # CSVダウンロード
+        csv_log = df_excl.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 除外ジョブCSVダウンロード",
             data=csv_log,
