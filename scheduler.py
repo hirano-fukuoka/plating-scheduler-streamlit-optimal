@@ -106,7 +106,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         for t in range(VALID_START_MIN, VALID_START_MAX + 1):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
-            # Soak/Rinseのみ
+            # Soak/Rinseだけを判定（Plating部分は判定しない）
             if all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in soak_range + rinse_range):
                 restricted = False
                 break
@@ -117,6 +117,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
                 "Reason": f"{job_id}: ❌ 勤務帯外 → Soak+Rinse が出勤時間に収まりません"
             })
             continue
+
 
         job_results.append({
             'index': i, 'start': start, 'soak': soak, 'duration': duration, 'rinse': rinse,
