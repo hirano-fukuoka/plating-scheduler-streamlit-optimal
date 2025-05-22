@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import timedelta
 import plotly.express as px
-from scheduler import optimize_schedule  # 別ファイルならimport（または同一ファイルに関数をコピペ）
+
 
 st.title("めっき工程スケジューラ【全タンクガントチャート可視化】")
 
