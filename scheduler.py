@@ -174,8 +174,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # 最大ジョブ数最大化
-    model.Maximize(sum(assigned))
+    # ★★ 優先度（ファイル上の上位）付き目的関数
+    priority_weights = [len(assigned) - i for i in range(len(assigned))]
+    model.Maximize(sum(priority_weights[i] * assigned[i] for i in range(len(assigned))))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 20.0
