@@ -158,12 +158,31 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
 
     # 作業者スロット制約
     for t in range(TOTAL_SLOTS):
-        demand = []
-        for j in job_vars:
-            is_soak = model.NewBoolVar(f"is_soak_{j['JobID']}_{t}")
-            model.Add(t >= j['start']).OnlyEnforceIf(is_soak)
-            model.Add(t < j['start'] + j['soak']).OnlyEnforceIf(is_soak)
-            model.AddBoolOr([t < j['start'], t >= j['start'] + j['soak']]).OnlyEnforceIf(is_soak.Not())
+    demand = []
+    for j in job_vars:
+        is_soak = model.NewBoolVar(f"is_soak_{j['JobID']}_{t}")
+
+        # ① 比較用のブール変数を用意
+        cond_before_soak = model.NewBoolVar(f"before_soak_{j['JobID']}_{t}")
+        cond_after_soak  = model.NewBoolVar(f"after_soak_{j['JobID']}_{t}")
+
+        # ② 比較条件をそれぞれのBoolVarに関連付け
+        model.Add(t < j['start']).OnlyEnforceIf(cond_before_soak)
+        model.Add(t >= j['start']).OnlyEnforceIf(cond_before_soak.Not())
+
+        model.Add(t >= j['start'] + j['soak']).OnlyEnforceIf(cond_after_soak)
+        model.Add(t < j['start'] + j['soak']).OnlyEnforceIf(cond_after_soak.Not())
+
+        # ③ AddBoolOr に BoolVar を渡す（is_soakがTrueでない場合＝Soak時間外なら）
+        model.AddBoolOr([cond_before_soak, cond_after_soak]).OnlyEnforceIf(is_soak.Not())
+
+        # Soak時間中であれば、demand追加（※これが負荷の要素）
+        model.Add(is_soak == 1).OnlyEnforceIf(j['pres'])
+        demand.append(is_soak * j['SoakWorker'])
+
+    if demand:
+        model.Add(sum(demand) <= slot_worker_capacity[t])
+
 
             is_rinse = model.NewBoolVar(f"is_rinse_{j['JobID']}_{t}")
             model.Add(t >= j['plating_end']).OnlyEnforceIf(is_rinse)
