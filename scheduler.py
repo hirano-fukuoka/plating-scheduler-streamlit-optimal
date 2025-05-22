@@ -5,7 +5,6 @@ import streamlit as st
 import plotly.express as px
 
 def find_first_workable_rinse_start(plating_end, rinse, workable_slots):
-    # plating_end 以降で「rinse連続勤務帯OK」の最初のスロットを返す
     for s in range(plating_end, len(workable_slots) - rinse + 1):
         if all(workable_slots[ss] for ss in range(s, s + rinse)):
             return s
@@ -29,7 +28,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     }
     all_so_ids = set(so_dict.keys())
 
-    # 作業者スロット生成
     worker_slots = {}
     worker_total_slots = {}
     for _, w in workers_df.iterrows():
@@ -104,11 +102,10 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             })
             continue
 
-        # Platingは自動機で連続稼働
         plating_start = soak_start + soak
         plating_end = plating_start + duration
 
-        # RinseはPlating終了後、勤務帯が再開するまで待機し、勤務帯内から連続開始
+        # RinseはPlating終了後、勤務帯が再開するまで待機
         rinse_start = find_first_workable_rinse_start(plating_end, rinse, global_workable_slots)
         if rinse_start is None:
             excluded_jobs.append({
@@ -131,7 +128,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         rinse_tank_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_start + rinse, pres, f"rinse_tank_{i}")
 
         job_results.append({
-            'index': i, 'start': start, 'soak': soak, 'duration': duration, 'rinse': rinse,
+            'index': i, 'start': soak_start, 'soak': soak, 'duration': duration, 'rinse': rinse,
             'pres': pres, 'JobID': job_id, 'PlatingType': job_type, 'TankID': soid,
             'SoakWorker': soak_workers, 'RinseWorker': rinse_workers,
             'soak_worker_int': soak_worker_int,
@@ -139,11 +136,16 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             'rinse_worker_int': rinse_worker_int,
             'soak_tank_int': soak_tank_int,
             'plating_tank_int': plating_tank_int,
-            'rinse_tank_int': rinse_tank_int
+            'rinse_tank_int': rinse_tank_int,
+            'rinse_start': rinse_start
         })
         assigned.append(pres)
 
-    # 槽NoOverlap制約
+    # OR-Toolsモデルが空だとエラーになるので、必ずSolve前にモデル構築
+    solver = cp_model.CpSolver()
+    status = cp_model.UNKNOWN  # 初期値
+
+    # NoOverlapなどの制約追加
     for soid in so_dict:
         intervals = []
         for job in job_results:
@@ -156,27 +158,31 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # ...solver = cp_model.CpSolver()...
-    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        for t in range(TOTAL_SLOTS):
-            demand_expr = []
-            for job in job_results:
-                soak_start = solver.Value(job['start'])
-                soak = job['soak']
-                # ...Rinseの開始時刻も同様にint値で管理...
-                if t >= soak_start and t < soak_start + soak:
-                    demand_expr.append(job['SoakWorker'])
-                # Rinseも同様に
-            if demand_expr:
-                model.Add(sum(demand_expr) <= slot_worker_capacity[t])
+    # 作業者リソース制約（Soak/Rinseのみ）
+    for t in range(TOTAL_SLOTS):
+        demand_expr = []
+        for job in job_results:
+            soak_start = job['start']
+            soak = job['soak']
+            rinse_start = job['rinse_start']
+            rinse = job['rinse']
+            pres = job['pres']
+            # Soak
+            if t >= soak_start and t < soak_start + soak:
+                demand_expr.append(job['SoakWorker'])
+            # Rinse
+            if t >= rinse_start and t < rinse_start + rinse:
+                demand_expr.append(job['RinseWorker'])
+        if demand_expr:
+            model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
     # 優先度付き最大化
     priority_weights = [len(assigned) - i for i in range(len(assigned))]
     model.Maximize(sum(priority_weights[i] * assigned[i] for i in range(len(assigned))))
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20.0
-    status = solver.Solve(model)
+    # ここで必ずSolveし、statusに値をセット
+    if job_results:
+        status = solver.Solve(model)
 
     results = []
     used_so_ids = set()
@@ -193,29 +199,27 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
                 })
                 continue
 
-            soak_start = solver.Value(job['start'])
+            soak_start = job['start']
             plating_start = soak_start + job['soak']
             plating_end = plating_start + job['duration']
-            # RinseはPlating終了後、最初の勤務帯から
-            rinse_start = find_first_workable_rinse_start(plating_end, job['rinse'], global_workable_slots)
+            rinse_start = job['rinse_start']
 
             used_so_ids.add(job['TankID'])
             for t in range(soak_start, soak_start + job['soak']):
                 slot_usage_map[t] += 1
-            if rinse_start is not None:
-                for t in range(rinse_start, rinse_start + job['rinse']):
-                    slot_usage_map[t] += 1
+            for t in range(rinse_start, rinse_start + job['rinse']):
+                slot_usage_map[t] += 1
 
             start_dt = start_date + timedelta(minutes=soak_start * SLOT_MIN)
             plating_end_dt = start_date + timedelta(minutes=plating_end * SLOT_MIN)
-            rinse_start_dt = start_date + timedelta(minutes=rinse_start * SLOT_MIN) if rinse_start is not None else None
+            rinse_start_dt = start_date + timedelta(minutes=rinse_start * SLOT_MIN)
 
             results.append({
                 "JobID": job['JobID'],
                 "PlatingType": job['PlatingType'],
                 "SoakStart": start_dt.strftime("%Y-%m-%d %H:%M"),
                 "PlatingEnd": plating_end_dt.strftime("%Y-%m-%d %H:%M"),
-                "RinseStart": rinse_start_dt.strftime("%Y-%m-%d %H:%M") if rinse_start_dt else "NA",
+                "RinseStart": rinse_start_dt.strftime("%Y-%m-%d %H:%M"),
                 "TankID": job['TankID'],
                 "SoakMin": job['soak'] * SLOT_MIN,
                 "PlatingMin": job['duration'] * SLOT_MIN,
