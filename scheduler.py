@@ -4,21 +4,27 @@ from datetime import timedelta
 import streamlit as st
 import plotly.express as px
 
-def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
+def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     model = cp_model.CpModel()
 
     SLOT_MIN = 30
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
-    TOTAL_SLOTS = SLOTS_PER_DAY * 7
+    SLOTS_PER_WEEK = SLOTS_PER_DAY * 7
+    MAX_WEEKS = 4  # 4週先まで持ち越し可能にする場合はここを調整
+    TOTAL_SLOTS = SLOTS_PER_WEEK * MAX_WEEKS
 
-    # 稼働中の槽のみ対象
+    # スケジューリング枠：今週分（開始可能なスロット範囲）
+    VALID_START_MIN = 0
+    VALID_START_MAX = SLOTS_PER_WEEK * weeks - 1
+
+    # 槽リスト
     so_dict = {
         str(row['SoID']).strip(): row for _, row in sos_df.iterrows()
         if str(row.get('Status', '')).strip() == '稼働中'
     }
     all_so_ids = set(so_dict.keys())
 
-    # 作業者スロットと稼働可能時間数
+    # 作業者リスト
     worker_slots = {}
     worker_total_slots = {}
     for _, w in workers_df.iterrows():
@@ -27,11 +33,12 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         total = 0
         for d in range(7):
             if str(w.get(f'Day{d+1}', '')).strip() == '〇':
-                s = int(float(w['StartHour']) * 2) + d * SLOTS_PER_DAY
-                e = int(float(w['EndHour']) * 2) + d * SLOTS_PER_DAY
-                total += (e - s)
-                for t in range(s, e):
-                    slots[t] = True
+                for week in range(MAX_WEEKS):
+                    s = int(float(w['StartHour']) * 2) + d * SLOTS_PER_DAY + week * SLOTS_PER_WEEK
+                    e = int(float(w['EndHour']) * 2) + d * SLOTS_PER_DAY + week * SLOTS_PER_WEEK
+                    total += (e - s)
+                    for t in range(s, e):
+                        slots[t] = True
         worker_slots[wid] = slots
         worker_total_slots[wid] = total
 
@@ -39,12 +46,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
     worker_usage = {wid: 0 for wid in worker_total_slots}
 
     assigned = []
-    all_tank_intervals = []
     job_results = []
     excluded_jobs = []
 
-    # スロットごとの作業者需要
-    slot_worker_demand = [0] * TOTAL_SLOTS
     slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
 
     for i, job in jobs_df.iterrows():
@@ -84,11 +88,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         soak_workers = int(row.get('SoakWorker', 1))
         rinse_workers = int(row.get('RinseWorker', 1))
 
-        pres = model.NewBoolVar(f"assigned_{i}")
-        start = model.NewIntVar(0, TOTAL_SLOTS - soak - duration - rinse, f"start_{i}")
+        # 開始スロットの範囲は「今週分だけ」
+        start = model.NewIntVar(VALID_START_MIN, VALID_START_MAX, f"start_{i}")
         soak_end = model.NewIntVar(0, TOTAL_SLOTS, f"soak_end_{i}")
         plate_end = model.NewIntVar(0, TOTAL_SLOTS, f"plate_end_{i}")
         rinse_end = model.NewIntVar(0, TOTAL_SLOTS, f"rinse_end_{i}")
+
+        pres = model.NewBoolVar(f"assigned_{i}")
 
         soak_worker_int = model.NewOptionalIntervalVar(start, soak, soak_end, pres, f"soak_worker_{i}")
         rinse_start = plate_end
@@ -99,9 +105,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         plate_int = model.NewOptionalIntervalVar(plate_start, duration, plate_end, pres, f"plate_{i}")
         rinse_tank_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_tank_{i}")
 
-        # Soak/Rinse の勤務帯チェック（人）
+        # Soak/Rinseの勤務帯チェック
         restricted = True
-        for t in range(TOTAL_SLOTS - soak - duration - rinse):
+        for t in range(VALID_START_MIN, VALID_START_MAX + 1):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
             combined = soak_range + rinse_range
@@ -130,7 +136,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
 
         assigned.append(pres)
 
-    # 槽NoOverlap制約（Soak/Plating/Rinse重複不可）
+    # 槽NoOverlap制約
     for soid in so_dict:
         intervals = []
         for job in job_results:
@@ -143,7 +149,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # 作業者リソース制約（Soak/Rinse工程の各スロットごと人数制約）
+    # 作業者リソース制約
     for t in range(TOTAL_SLOTS):
         demand_expr = []
         for job in job_results:
@@ -168,11 +174,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # 目的関数
+    # 最大ジョブ数最大化
     model.Maximize(sum(assigned))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 15.0
+    solver.parameters.max_time_in_seconds = 20.0
     status = solver.Solve(model)
 
     results = []
@@ -199,10 +205,14 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
                 slot_usage_map[t] += 1
 
             start_dt = start_date + timedelta(minutes=start_val * SLOT_MIN)
+            # Plating終了時刻計算
+            plate_end_val = start_val + job['soak'] + job['duration']
+            plate_end_dt = start_date + timedelta(minutes=plate_end_val * SLOT_MIN)
             results.append({
                 "JobID": job['JobID'],
                 "PlatingType": job['PlatingType'],
                 "StartTime": start_dt.strftime("%Y-%m-%d %H:%M"),
+                "PlatingEnd": plate_end_dt.strftime("%Y-%m-%d %H:%M"),
                 "DurationMin": job['duration'] * SLOT_MIN,
                 "TankID": job['TankID'],
                 "SoakMin": job['soak'] * SLOT_MIN,
@@ -223,18 +233,13 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
             else:
                 st.write("🔹", reason)
 
-        # DataFrame化しカテゴリごとに集計
         df_excl = pd.DataFrame(excluded_jobs)
         reason_summary = df_excl['Category'].value_counts().reset_index()
         reason_summary.columns = ['除外理由カテゴリ', '件数']
         st.subheader("📝 除外理由ごとの集計")
         st.dataframe(reason_summary)
-        # 円グラフ
         fig = px.pie(reason_summary, names='除外理由カテゴリ', values='件数', title="除外ジョブ理由の割合")
         st.plotly_chart(fig, use_container_width=True)
-
-        # CSVダウンロード
-        df_excl = pd.DataFrame(excluded_jobs)
         csv_log = df_excl.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="📥 除外ジョブCSVダウンロード",
