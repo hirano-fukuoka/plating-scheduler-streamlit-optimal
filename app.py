@@ -1,62 +1,107 @@
-import streamlit as st
+from ortools.sat.python import cp_model
 import pandas as pd
-from datetime import date
-from scheduler import optimize_schedule
-from utils import plot_gantt
-import traceback
+from datetime import timedelta
+import streamlit as st
+import plotly.express as px
 
-st.set_page_config(page_title="めっき工程スケジューラ", layout="wide")
+# ...（ここに optimize_schedule 関数を入れてください。既存のままでもOK）...
 
-st.title("🧪 めっき工程スケジューラ（Streamlit + OR-Tools）")
+def find_free_ranges(slot_array):
+    free_ranges = []
+    in_free = False
+    for t, used in enumerate(slot_array):
+        if not used and not in_free:
+            start = t
+            in_free = True
+        elif used and in_free:
+            end = t
+            free_ranges.append((start, end))
+            in_free = False
+    if in_free:
+        free_ranges.append((start, len(slot_array)))
+    return free_ranges
 
-st.sidebar.header("📅 スケジュール条件")
+# ---- Streamlitメイン処理 ----
+st.title("めっき工程スケジューラ（ガント・空き時間可視化つき）")
 
-start_date = st.sidebar.date_input("スケジュール開始日", value=date(2025, 5, 20))
+# ファイルアップロードUI
+jobs_file = st.file_uploader("jobs.csvをアップロード", type="csv")
+sos_file = st.file_uploader("so_template.csvをアップロード", type="csv")
+workers_file = st.file_uploader("workers_template.csvをアップロード", type="csv")
+start_date = st.date_input("スケジュール開始日", value=pd.Timestamp.today())
+weeks = st.number_input("スケジュール対象週数", min_value=1, max_value=4, value=1)
 
-uploaded_job = st.sidebar.file_uploader("📎 品物リストCSV", type=["csv"])
-uploaded_so = st.sidebar.file_uploader("📎 槽リストCSV", type=["csv"])
-uploaded_worker = st.sidebar.file_uploader("📎 作業者リストCSV", type=["csv"])
+if jobs_file and sos_file and workers_file:
+    jobs_df = pd.read_csv(jobs_file)
+    sos_df = pd.read_csv(sos_file)
+    workers_df = pd.read_csv(workers_file)
+    df_result = optimize_schedule(jobs_df, workers_df, sos_df, pd.to_datetime(start_date), weeks=weeks)
+    if df_result.shape[0] > 0:
+        st.subheader("🗓 ガントチャート（タンク別/工程別）")
+        # ====== ガントチャート用データ作成 ======
+        gantt_data = []
+        for _, row in df_result.iterrows():
+            # Soak
+            soak_start_dt = pd.to_datetime(row["SoakStart"])
+            soak_end_dt = soak_start_dt + pd.Timedelta(minutes=row["SoakMin"])
+            # Plating
+            plating_start_dt = soak_end_dt
+            plating_end_dt = pd.to_datetime(row["PlatingEnd"])
+            # Rinse
+            rinse_start_dt = pd.to_datetime(row["RinseStart"])
+            rinse_end_dt = rinse_start_dt + pd.Timedelta(minutes=row["RinseMin"])
+            gantt_data += [
+                dict(JobID=row["JobID"], 工程="Soak", TankID=row["TankID"], Start=soak_start_dt, End=soak_end_dt),
+                dict(JobID=row["JobID"], 工程="Plating", TankID=row["TankID"], Start=plating_start_dt, End=plating_end_dt),
+                dict(JobID=row["JobID"], 工程="Rinse", TankID=row["TankID"], Start=rinse_start_dt, End=rinse_end_dt)
+            ]
+        df_gantt = pd.DataFrame(gantt_data)
 
-if uploaded_job and uploaded_so and uploaded_worker:
-    try:
-        jobs_df = pd.read_csv(uploaded_job)
-        sos_df = pd.read_csv(uploaded_so)
-        workers_df = pd.read_csv(uploaded_worker)
+        fig = px.timeline(
+            df_gantt,
+            x_start="Start",
+            x_end="End",
+            y="TankID",
+            color="工程",
+            hover_data=["JobID"]
+        )
+        fig.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("🧾 品物一覧")
-        st.dataframe(jobs_df)
+        # ====== 空き時間帯の可視化 ======
+        st.subheader("🕳 タンクごとの空き時間帯")
+        SLOT_MIN = 30
+        SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
+        SLOTS_PER_WEEK = SLOTS_PER_DAY * 7
+        MAX_WEEKS = 4
+        TOTAL_SLOTS = SLOTS_PER_WEEK * weeks
 
-        st.subheader("🛢 槽一覧")
-        st.dataframe(sos_df)
+        all_so_ids = df_result['TankID'].unique()
+        tank_slots = {tank: [False] * TOTAL_SLOTS for tank in all_so_ids}
+        for _, row in df_result.iterrows():
+            soak_start = int(((pd.to_datetime(row["SoakStart"]) - pd.to_datetime(start_date)).total_seconds() // 60) // SLOT_MIN)
+            soak_end = soak_start + int(row["SoakMin"]) // SLOT_MIN
+            plating_end = int(((pd.to_datetime(row["PlatingEnd"]) - pd.to_datetime(start_date)).total_seconds() // 60) // SLOT_MIN)
+            rinse_start = int(((pd.to_datetime(row["RinseStart"]) - pd.to_datetime(start_date)).total_seconds() // 60) // SLOT_MIN)
+            rinse_end = rinse_start + int(row["RinseMin"]) // SLOT_MIN
 
-        st.subheader("👷 作業者一覧")
-        st.dataframe(workers_df)
+            for t in range(soak_start, soak_end):
+                tank_slots[row["TankID"]][t] = True
+            for t in range(soak_end, plating_end):
+                tank_slots[row["TankID"]][t] = True
+            for t in range(rinse_start, rinse_end):
+                tank_slots[row["TankID"]][t] = True
 
-        if st.button("📌 スケジュール作成"):
-            try:
-                schedule_df = optimize_schedule(jobs_df, workers_df, sos_df, pd.to_datetime(start_date))
+        for tank in all_so_ids:
+            free_ranges = find_free_ranges(tank_slots[tank])
+            if free_ranges:
+                st.write(f"🔹 タンク {tank} の空き時間帯:")
+                for start, end in free_ranges:
+                    st.write(f"　{(pd.to_datetime(start_date) + timedelta(minutes=start*SLOT_MIN)).strftime('%Y-%m-%d %H:%M')} ～ {(pd.to_datetime(start_date) + timedelta(minutes=end*SLOT_MIN)).strftime('%Y-%m-%d %H:%M')}")
+            else:
+                st.write(f"🔹 タンク {tank} は空き枠なし！")
 
-                if 'StartTime' not in schedule_df.columns or schedule_df.empty:
-                    st.warning("⚠ スケジュールが空です。診断情報をご確認ください。")
-                else:
-                    schedule_df["StartTime"] = pd.to_datetime(schedule_df["StartTime"])
-                    schedule_df["EndTime"] = schedule_df["StartTime"] + pd.to_timedelta(schedule_df["DurationMin"], unit="m")
-
-                    st.subheader("📋 スケジュール一覧")
-                    st.dataframe(schedule_df)
-
-                    st.subheader("📊 ガントチャート")
-                    fig = plot_gantt(schedule_df)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    csv = schedule_df.to_csv(index=False).encode("utf-8")
-                    st.download_button("📥 スケジュールCSVダウンロード", csv, "schedule.csv", mime="text/csv")
-
-            except Exception as e:
-                st.error(f"❌ スケジュール処理中にエラーが発生しました: {e}")
-                st.code(traceback.format_exc())
-    except Exception as e:
-        st.error(f"❌ データ読み込み時にエラーが発生しました: {e}")
-        st.code(traceback.format_exc())
+    else:
+        st.warning("スケジュールが空です。診断情報をご確認ください。")
 else:
-    st.info("左側から3つのCSVファイル（品物・槽・作業者）をすべてアップロードしてください。")
+    st.info("入力ファイルを3つすべてアップロードしてください。")
