@@ -234,7 +234,8 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date):
         st.plotly_chart(fig, use_container_width=True)
 
         # CSVダウンロード
-        csv_log = df_excl.to_csv(index=False).encode("utf-8")
+        df_excl = pd.DataFrame(excluded_jobs)
+        csv_log = df_excl.to_csv(index=False, encoding="utf-8-sig")
         st.download_button(
             label="📥 除外ジョブCSVダウンロード",
             data=csv_log,
