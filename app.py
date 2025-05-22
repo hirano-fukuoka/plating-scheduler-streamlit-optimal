@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import timedelta
 import streamlit as st
 import plotly.express as px
+from scheduler import optimize_schedule  # 別ファイルならこの行を必ず書く
 
 # ...（ここに optimize_schedule 関数を入れてください。既存のままでもOK）...
 
