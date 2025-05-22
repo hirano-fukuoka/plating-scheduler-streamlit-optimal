@@ -147,16 +147,18 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         for j in job_vars:
             is_soak = model.NewBoolVar(f"is_soak_{j['JobID']}_{t}")
             is_rinse = model.NewBoolVar(f"is_rinse_{j['JobID']}_{t}")
-
-            # Soak区間
+    
+            # Soak区間: t >= start AND t < start + soak
             model.Add(t >= j['start']).OnlyEnforceIf(is_soak)
             model.Add(t <  j['start'] + j['soak']).OnlyEnforceIf(is_soak)
-            model.AddBoolOr([t < j['start'], t >= j['start'] + j['soak']]).OnlyEnforceIf(is_soak.Not())
-
-            # Rinse区間
-            model.Add(t >= j['plating_end']).OnlyEnforceIf(is_rinse)
-            model.Add(t <  j['plating_end'] + j['rinse']).OnlyEnforceIf(is_rinse)
-            model.AddBoolOr([t < j['plating_end'], t >= j['plating_end'] + j['rinse']]).OnlyEnforceIf(is_rinse.Not())
+            # 逆はis_soak.Not()
+            is_before = model.NewBoolVar(f"before_{j['JobID']}_{t}")
+            is_after  = model.NewBoolVar(f"after_{j['JobID']}_{t}")
+            model.Add(t < j['start']).OnlyEnforceIf(is_before)
+            model.Add(t >= j['start']).OnlyEnforceIf(is_before.Not())
+            model.Add(t >= j['start'] + j['soak']).OnlyEnforceIf(is_after)
+            model.Add(t < j['start'] + j['soak']).OnlyEnforceIf(is_after.Not())
+            model.AddBoolOr([is_before, is_after]).OnlyEnforceIf(is_soak.Not())
 
             # Soak
             demand.append(is_soak * j['pres'])
