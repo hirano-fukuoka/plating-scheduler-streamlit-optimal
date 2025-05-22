@@ -14,16 +14,15 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     VALID_START_MIN = 0
     VALID_START_MAX = SLOTS_PER_WEEK * weeks - 1
 
-    # 槽リスト
+    # 槽（稼働中のみ）
     so_dict = {
         str(row['SoID']).strip(): row for _, row in sos_df.iterrows()
         if str(row.get('Status', '')).strip() == '稼働中'
     }
     all_so_ids = sorted(so_dict.keys())
     tank_id_to_idx = {soid: idx for idx, soid in enumerate(all_so_ids)}
-    num_tanks = len(all_so_ids)
 
-    # 作業者可用性
+    # 作業者勤務可否スロット
     worker_slots = {}
     for _, w in workers_df.iterrows():
         wid = w['WorkerID']
@@ -38,8 +37,9 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         worker_slots[wid] = slots
 
     global_workable_slots = [any(worker_slots[w][t] for w in worker_slots) for t in range(TOTAL_SLOTS)]
-    slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
+    slot_worker_capacity = [sum(worker_slots[w][t] for w in worker_slots) for t in range(TOTAL_SLOTS)]
 
+    # ジョブ整形
     jobs = []
     for i, job in jobs_df.iterrows():
         job_id = str(job.get('JobID', f"job_{i}")).strip()
@@ -60,7 +60,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if not valid_sos:
             continue
 
-        # 各工程の必要人数
         soak_workers = int(so_dict[valid_sos[0]].get('SoakWorker', 1))
         rinse_workers = int(so_dict[valid_sos[0]].get('RinseWorker', 1))
         jobs.append(dict(
@@ -78,15 +77,12 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     tank_intervals = {soid: [] for soid in all_so_ids}
 
     for job in jobs:
-        min_total_len = job["soak"] + job["duration"] + job["rinse"]
-        latest_start = VALID_START_MAX - min_total_len + 1
-        if latest_start < VALID_START_MIN:
-            continue
-
+        total_len = job["soak"] + job["duration"] + job["rinse"]
+        latest_start = TOTAL_SLOTS - total_len
         pres = model.NewBoolVar(f"assigned_{job['JobID']}")
         assigned.append(pres)
 
-        start = model.NewIntVar(VALID_START_MIN, latest_start, f"start_{job['JobID']}")
+        start = model.NewIntVar(0, latest_start, f"start_{job['JobID']}")
         tank_choices = [tank_id_to_idx[soid] for soid in job["valid_sos"]]
         tank = model.NewIntVarFromDomain(cp_model.Domain.FromValues(tank_choices), f"tank_{job['JobID']}")
 
@@ -108,11 +104,11 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             model.Add(tank != t_idx).OnlyEnforceIf(sel.Not())
             tank_intervals[soid].append((sel, soak_int, plating_int, rinse_int, pres, job))
 
-        # Soak/Rinseが勤務帯内
+        # Soak/Rinse が勤務帯内に収まるかチェック
         for phase, length, offset in [("soak", job['soak'], 0), ("rinse", job['rinse'], job['soak'] + job['duration'])]:
             for t in range(VALID_START_MIN, latest_start + 1):
-                idxs = [t + offset + k for k in range(length)]
-                if not all(0 <= idx < TOTAL_SLOTS and global_workable_slots[idx] for idx in idxs):
+                time_slots = [t + offset + k for k in range(length)]
+                if not all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in time_slots):
                     model.Add(start != t).OnlyEnforceIf(pres)
 
         job_vars.append(dict(
@@ -124,88 +120,89 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             rinse=job['rinse'],
             tank=tank,
             pres=pres,
-            soak_int=soak_int, plating_int=plating_int, rinse_int=rinse_int,
-            soak_end=soak_end, plating_end=plating_end, rinse_end=rinse_end,
-            SoakWorker=job['SoakWorker'], RinseWorker=job['RinseWorker']
+            soak_int=soak_int,
+            plating_int=plating_int,
+            rinse_int=rinse_int,
+            soak_end=soak_end,
+            plating_end=plating_end,
+            rinse_end=rinse_end,
+            SoakWorker=job['SoakWorker'],
+            RinseWorker=job['RinseWorker']
         ))
 
+    # 各タンク内での工程重複を防ぐ（NoOverlap）
     for soid, interval_list in tank_intervals.items():
         all_ints = []
-        for v in interval_list:
-            all_ints += [v[1], v[2], v[3]]
+        for sel, soak_i, plate_i, rinse_i, pres, job in interval_list:
+            all_ints += [soak_i, plate_i, rinse_i]
         if all_ints:
             model.AddNoOverlap(all_ints)
 
-    # 作業者リソース（Soak/Rinseのみ人数分反映）
+    # 作業者リソース制約（Soak/Rinse工程ごとの必要人数を反映）
     for t in range(TOTAL_SLOTS):
         demand = []
         for j in job_vars:
+            # Soak: t ∈ [start, start + soak)
             is_soak = model.NewBoolVar(f"is_soak_{j['JobID']}_{t}")
-            is_rinse = model.NewBoolVar(f"is_rinse_{j['JobID']}_{t}")
-
-            # Soak区間: t >= start AND t < start + soak
             model.Add(t >= j['start']).OnlyEnforceIf(is_soak)
-            model.Add(t <  j['start'] + j['soak']).OnlyEnforceIf(is_soak)
-            is_before = model.NewBoolVar(f"before_{j['JobID']}_{t}")
-            is_after  = model.NewBoolVar(f"after_{j['JobID']}_{t}")
-            model.Add(t < j['start']).OnlyEnforceIf(is_before)
-            model.Add(t >= j['start']).OnlyEnforceIf(is_before.Not())
-            model.Add(t >= j['start'] + j['soak']).OnlyEnforceIf(is_after)
-            model.Add(t < j['start'] + j['soak']).OnlyEnforceIf(is_after.Not())
-            model.AddBoolOr([is_before, is_after]).OnlyEnforceIf(is_soak.Not())
+            model.Add(t < j['start'] + j['soak']).OnlyEnforceIf(is_soak)
+            model.AddBoolOr([t < j['start'], t >= j['start'] + j['soak']]).OnlyEnforceIf(is_soak.Not())
 
-            # Rinse区間
+            # Rinse: t ∈ [plating_end, plating_end + rinse)
+            is_rinse = model.NewBoolVar(f"is_rinse_{j['JobID']}_{t}")
             model.Add(t >= j['plating_end']).OnlyEnforceIf(is_rinse)
-            model.Add(t <  j['plating_end'] + j['rinse']).OnlyEnforceIf(is_rinse)
-            is_r_before = model.NewBoolVar(f"rinse_before_{j['JobID']}_{t}")
-            is_r_after  = model.NewBoolVar(f"rinse_after_{j['JobID']}_{t}")
-            model.Add(t < j['plating_end']).OnlyEnforceIf(is_r_before)
-            model.Add(t >= j['plating_end']).OnlyEnforceIf(is_r_before.Not())
-            model.Add(t >= j['plating_end'] + j['rinse']).OnlyEnforceIf(is_r_after)
-            model.Add(t < j['plating_end'] + j['rinse']).OnlyEnforceIf(is_r_after.Not())
-            model.AddBoolOr([is_r_before, is_r_after]).OnlyEnforceIf(is_rinse.Not())
+            model.Add(t < j['plating_end'] + j['rinse']).OnlyEnforceIf(is_rinse)
+            model.AddBoolOr([t < j['plating_end'], t >= j['plating_end'] + j['rinse']]).OnlyEnforceIf(is_rinse.Not())
 
-            # Soak
+            # 人数分の作業スロットにカウント
             for _ in range(j['SoakWorker']):
-                is_active = model.NewBoolVar(f"is_active_soak_{j['JobID']}_{t}")
-                model.AddBoolAnd([is_soak, j['pres']]).OnlyEnforceIf(is_active)
-                model.AddBoolOr([is_soak.Not(), j['pres'].Not()]).OnlyEnforceIf(is_active.Not())
-                demand.append(is_active)
-            # Rinse
+                active = model.NewBoolVar(f"active_soak_{j['JobID']}_{t}")
+                model.AddBoolAnd([is_soak, j['pres']]).OnlyEnforceIf(active)
+                model.AddBoolOr([is_soak.Not(), j['pres'].Not()]).OnlyEnforceIf(active.Not())
+                demand.append(active)
+
             for _ in range(j['RinseWorker']):
-                is_active_rinse = model.NewBoolVar(f"is_active_rinse_{j['JobID']}_{t}")
-                model.AddBoolAnd([is_rinse, j['pres']]).OnlyEnforceIf(is_active_rinse)
-                model.AddBoolOr([is_rinse.Not(), j['pres'].Not()]).OnlyEnforceIf(is_active_rinse.Not())
-                demand.append(is_active_rinse)
+                active_r = model.NewBoolVar(f"active_rinse_{j['JobID']}_{t}")
+                model.AddBoolAnd([is_rinse, j['pres']]).OnlyEnforceIf(active_r)
+                model.AddBoolOr([is_rinse.Not(), j['pres'].Not()]).OnlyEnforceIf(active_r.Not())
+                demand.append(active_r)
+
         if demand:
             model.Add(sum(demand) <= slot_worker_capacity[t])
 
+    # 🎯 目的：最大ジョブ数
     model.Maximize(sum([j['pres'] for j in job_vars]))
 
+    # ソルバ
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
 
+    # 結果の整形
     results = []
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         for j in job_vars:
             if solver.Value(j['pres']) == 1:
                 tank_idx = solver.Value(j['tank'])
                 tank_id = all_so_ids[tank_idx]
+
                 soak_start = solver.Value(j['start'])
                 soak_end = soak_start + j['soak']
                 plating_end = soak_end + j['duration']
                 rinse_end = plating_end + j['rinse']
+
                 results.append({
                     "JobID": j['JobID'],
                     "PlatingType": j['PlatingType'],
+                    "TankID": tank_id,
                     "SoakStart": (start_date + timedelta(minutes=soak_start * SLOT_MIN)).strftime("%Y-%m-%d %H:%M"),
                     "SoakEnd": (start_date + timedelta(minutes=soak_end * SLOT_MIN)).strftime("%Y-%m-%d %H:%M"),
                     "PlatingEnd": (start_date + timedelta(minutes=plating_end * SLOT_MIN)).strftime("%Y-%m-%d %H:%M"),
                     "RinseEnd": (start_date + timedelta(minutes=rinse_end * SLOT_MIN)).strftime("%Y-%m-%d %H:%M"),
-                    "TankID": tank_id,
                     "SoakMin": j['soak'] * SLOT_MIN,
                     "PlatingMin": j['duration'] * SLOT_MIN,
-                    "RinseMin": j['rinse'] * SLOT_MIN,
+                    "RinseMin": j['rinse'] * SLOT_MIN
                 })
-    df_result = pd.DataFrame(results)
-    return df_result
+
+    return pd.DataFrame(results)
+
+
