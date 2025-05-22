@@ -156,23 +156,19 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # 作業者リソース制約（Soak/RinseのみでOK、Platingは自動稼働で不要）
-    for t in range(TOTAL_SLOTS):
-        demand_expr = []
-        for job in job_results:
-            i = job['index']
-            pres = job['pres']
-            soak = job['soak']
-            rinse = job['rinse']
-            soak_start = model.GetVarValue(job['start']) if hasattr(model, 'GetVarValue') else job['start'].Name()
-            rinse_start = None  # 厳密には前で求めた値を使う
-            # Soak
-            if t >= soak_start and t < soak_start + soak:
-                demand_expr.append(job['SoakWorker'])
-            # Rinse
-            # （この部分はCPモデル上、各jobのrinse_startを個別で求める必要がある）
-        if demand_expr:
-            model.Add(sum(demand_expr) <= slot_worker_capacity[t])
+    # ...solver = cp_model.CpSolver()...
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        for t in range(TOTAL_SLOTS):
+            demand_expr = []
+            for job in job_results:
+                soak_start = solver.Value(job['start'])
+                soak = job['soak']
+                # ...Rinseの開始時刻も同様にint値で管理...
+                if t >= soak_start and t < soak_start + soak:
+                    demand_expr.append(job['SoakWorker'])
+                # Rinseも同様に
+            if demand_expr:
+                model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
     # 優先度付き最大化
     priority_weights = [len(assigned) - i for i in range(len(assigned))]
