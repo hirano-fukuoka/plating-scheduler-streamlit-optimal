@@ -10,7 +10,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
     SLOT_MIN = 30
     SLOTS_PER_DAY = 24 * 60 // SLOT_MIN
     SLOTS_PER_WEEK = SLOTS_PER_DAY * 7
-    MAX_WEEKS = 4  # 4週先まで持ち越し可能にする場合はここを調整
+    MAX_WEEKS = 4  # 最大持ち越し週数（必要に応じて増減）
     TOTAL_SLOTS = SLOTS_PER_WEEK * MAX_WEEKS
 
     # スケジューリング枠：今週分（開始可能なスロット範囲）
@@ -44,16 +44,14 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
 
     global_workable_slots = [any(worker_slots[w][t] for w in worker_slots) for t in range(TOTAL_SLOTS)]
     worker_usage = {wid: 0 for wid in worker_total_slots}
+    slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
 
     assigned = []
     job_results = []
     excluded_jobs = []
 
-    slot_worker_capacity = [sum(worker_slots[wid][t] for wid in worker_slots) for t in range(TOTAL_SLOTS)]
-
     for i, job in jobs_df.iterrows():
         job_id = str(job.get('JobID', f"job_{i}")).strip()
-
         try:
             soak = int(float(job['入槽時間'])) // SLOT_MIN
             duration = int(float(job['PlatingMin']) * 60) // SLOT_MIN
@@ -74,7 +72,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             if job_type == str(row.get('PlatingType', '')).strip()
             and (required_type == '' or required_type == str(row.get('SoType', row.get('種類', ''))).strip())
         ]
-
         if not valid_sos:
             excluded_jobs.append({
                 "JobID": job_id,
@@ -93,7 +90,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         soak_end = model.NewIntVar(0, TOTAL_SLOTS, f"soak_end_{i}")
         plate_end = model.NewIntVar(0, TOTAL_SLOTS, f"plate_end_{i}")
         rinse_end = model.NewIntVar(0, TOTAL_SLOTS, f"rinse_end_{i}")
-
         pres = model.NewBoolVar(f"assigned_{i}")
 
         soak_worker_int = model.NewOptionalIntervalVar(start, soak, soak_end, pres, f"soak_worker_{i}")
@@ -105,16 +101,15 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         plate_int = model.NewOptionalIntervalVar(plate_start, duration, plate_end, pres, f"plate_{i}")
         rinse_tank_int = model.NewOptionalIntervalVar(rinse_start, rinse, rinse_end, pres, f"rinse_tank_{i}")
 
-        # Soak/Rinseの勤務帯チェック
+        # Soak/Rinseだけ勤務帯判定（Platingは自動機稼働OKで制限しない）
         restricted = True
         for t in range(VALID_START_MIN, VALID_START_MAX + 1):
             soak_range = list(range(t, t + soak))
             rinse_range = list(range(t + soak + duration, t + soak + duration + rinse))
-            combined = soak_range + rinse_range
-            if all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in combined):
+            # Soak/Rinseのみ
+            if all(0 <= s < TOTAL_SLOTS and global_workable_slots[s] for s in soak_range + rinse_range):
                 restricted = False
-            else:
-                model.Add(start != t)
+                break
         if restricted:
             excluded_jobs.append({
                 "JobID": job_id,
@@ -133,7 +128,6 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
             'plate_int': plate_int,
             'rinse_tank_int': rinse_tank_int
         })
-
         assigned.append(pres)
 
     # 槽NoOverlap制約
@@ -174,7 +168,7 @@ def optimize_schedule(jobs_df, workers_df, sos_df, start_date, weeks=1):
         if demand_expr:
             model.Add(sum(demand_expr) <= slot_worker_capacity[t])
 
-    # ★★ 優先度（ファイル上の上位）付き目的関数
+    # ★ 優先度（ファイル上の上位）付き目的関数
     priority_weights = [len(assigned) - i for i in range(len(assigned))]
     model.Maximize(sum(priority_weights[i] * assigned[i] for i in range(len(assigned))))
 
